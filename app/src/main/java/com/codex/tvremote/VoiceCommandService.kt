@@ -71,13 +71,30 @@ class VoiceCommandService : Service() {
 
     private fun downloadAndExtract() {
         updateNotification("Downloading Arabic voice model (158 MB)…")
-        val archive = File(cacheDir, "$modelName.zip")
-        val connection = (URL(modelUrl).openConnection() as HttpURLConnection).apply { connectTimeout = 30000; readTimeout = 60000; instanceFollowRedirects = true }
+        // Keep the archive in filesDir, not cacheDir: Android may clear cache while a
+        // large model is downloading, which used to leave ZipInputStream with no file.
+        val archive = File(filesDir, "$modelName.zip")
+        val partial = File(filesDir, "$modelName.zip.part")
+        val connection = (URL(modelUrl).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 45_000
+            readTimeout = 120_000
+            instanceFollowRedirects = true
+            setRequestProperty("User-Agent", "TV-Voice-Remote/1.0 Android")
+        }
         try {
             connection.connect()
-            check(connection.responseCode in 200..299) { "Model download failed (${connection.responseCode})" }
-            connection.inputStream.use { input -> FileOutputStream(archive).use { output -> input.copyTo(output) } }
-            val temp = File(filesDir, "model-extract").apply { deleteRecursively(); mkdirs() }
+            val response = connection.responseCode
+            check(response in 200..299) { "Model download failed (HTTP $response)" }
+            partial.delete()
+            connection.inputStream.use { input -> FileOutputStream(partial).use { output -> input.copyTo(output) } }
+            check(partial.isFile && partial.length() > 1_000_000L) {
+                "Model download incomplete (${partial.length()} bytes). Check internet and free storage, then try again."
+            }
+            if (archive.exists()) check(archive.delete()) { "Could not replace previous model download" }
+            check(partial.renameTo(archive)) { "Could not save model archive in app storage" }
+
+            updateNotification("Installing Arabic voice model…")
+            val temp = File(filesDir, "model-extract").apply { deleteRecursively(); check(mkdirs()) }
             ZipInputStream(BufferedInputStream(archive.inputStream())).use { zip ->
                 var entry = zip.nextEntry
                 while (entry != null) {
@@ -86,16 +103,24 @@ class VoiceCommandService : Service() {
                         val out = File(temp, rel).canonicalFile
                         require(out.toPath().startsWith(temp.canonicalFile.toPath())) { "Unsafe model archive" }
                         if (entry.isDirectory) out.mkdirs() else {
-                            out.parentFile?.mkdirs(); FileOutputStream(out).use { zip.copyTo(it) }
+                            out.parentFile?.mkdirs()
+                            FileOutputStream(out).use { zip.copyTo(it) }
                         }
                     }
-                    zip.closeEntry(); entry = zip.nextEntry
+                    zip.closeEntry()
+                    entry = zip.nextEntry
                 }
             }
-            check(temp.resolve("am/final.mdl").isFile) { "Invalid Arabic model archive" }
-            modelDir.deleteRecursively(); check(temp.renameTo(modelDir)) { "Could not install model" }
+            check(temp.resolve("am/final.mdl").isFile) { "Downloaded file is not a valid Arabic Vosk model ZIP" }
+            modelDir.deleteRecursively()
+            check(temp.renameTo(modelDir)) { "Could not install model; check free storage" }
             archive.delete()
-        } finally { connection.disconnect() }
+        } catch (e: Exception) {
+            partial.delete()
+            throw e
+        } finally {
+            connection.disconnect()
+        }
     }
 
     private fun startRecordingLoop() {
