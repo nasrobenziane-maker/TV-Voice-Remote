@@ -10,6 +10,7 @@ import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.Build
 import android.os.IBinder
+import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -19,9 +20,11 @@ import org.vosk.Recognizer
 import java.io.BufferedInputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Locale
+import java.util.zip.ZipFile
 import java.util.zip.ZipInputStream
 import kotlin.concurrent.thread
 
@@ -48,6 +51,7 @@ class VoiceCommandService : Service() {
     override fun onDestroy() {
         destroyed = true
         running = false
+        setModelStatus(null)
         try { recorder?.stop() } catch (_: Exception) { }
         recorder?.release(); recorder = null
         recognizer?.close(); recognizer = null
@@ -59,41 +63,63 @@ class VoiceCommandService : Service() {
         try {
             if (!modelDir.resolve("am/final.mdl").isFile) downloadAndExtract()
             if (destroyed) return
+            setModelStatus("Loading model…")
             val model = Model(modelDir.absolutePath)
             val grammar = """["تشغيل","ابدأ","ابدأ التشغيل","إيقاف","توقف","أوقف","التالي","الفيديو التالي","السابق","الفيديو السابق","تقديم دقيقة","قدم دقيقة","إرجاع دقيقة","ارجع دقيقة","ارفع الصوت","علي الصوت","اخفض الصوت","خفض الصوت","كتم","اكتم الصوت","ألغ الكتم","إلغاء الكتم","تي في تشغيل","تي في إيقاف","تي في التالي","تي في السابق","تي في تقديم دقيقة","تي في إرجاع دقيقة","تي في ارفع الصوت","تي في اخفض الصوت","تي في كتم","تي في ألغ الكتم"]"""
             recognizer = Recognizer(model, 16000.0f, grammar)
             startRecordingLoop()
+        } catch (_: DownloadCancelled) {
+            // stopped by the user while downloading
         } catch (e: Exception) {
             event("Error: ${e.message ?: e.javaClass.simpleName}")
             stopSelf()
         }
     }
 
+    private class DownloadCancelled : Exception()
+
+    private fun setModelStatus(text: String?) {
+        val editor = getSharedPreferences("remote", MODE_PRIVATE).edit()
+        if (text == null) editor.remove("model_status") else editor.putString("model_status", text)
+        editor.apply()
+    }
+
+    private fun mb(bytes: Long) = bytes / (1024 * 1024)
+
+    private fun reportProgress(done: Long, total: Long) {
+        val text = if (total > 0) "Downloading model: ${done * 100 / total}% (${mb(done)} / ${mb(total)} MB)" else "Downloading model: ${mb(done)} MB"
+        setModelStatus(text)
+        updateNotification(text)
+    }
+
+    /** A truncated ZIP has no central directory at its end, so opening it fails: this catches incomplete downloads. */
+    private fun isValidZip(file: File): Boolean = file.isFile && file.length() > 1_000_000L && try {
+        ZipFile(file).use { zip -> zip.entries().asSequence().any { it.name.endsWith("am/final.mdl") } }
+    } catch (_: Exception) { false }
+
+    private fun waitOrCancel(millis: Long) {
+        var left = millis
+        while (left > 0) {
+            if (destroyed) throw DownloadCancelled()
+            Thread.sleep(500)
+            left -= 500
+        }
+    }
+
     private fun downloadAndExtract() {
-        updateNotification("Downloading Arabic voice model (158 MB)…")
-        // Keep the archive in filesDir, not cacheDir: Android may clear cache while a
-        // large model is downloading, which used to leave ZipInputStream with no file.
         val archive = File(filesDir, "$modelName.zip")
         val partial = File(filesDir, "$modelName.zip.part")
-        val connection = (URL(modelUrl).openConnection() as HttpURLConnection).apply {
-            connectTimeout = 45_000
-            readTimeout = 120_000
-            instanceFollowRedirects = true
-            setRequestProperty("User-Agent", "TV-Voice-Remote/1.0 Android")
-        }
-        try {
-            connection.connect()
-            val response = connection.responseCode
-            check(response in 200..299) { "Model download failed (HTTP $response)" }
-            partial.delete()
-            connection.inputStream.use { input -> FileOutputStream(partial).use { output -> input.copyTo(output) } }
-            check(partial.isFile && partial.length() > 1_000_000L) {
-                "Model download incomplete (${partial.length()} bytes). Check internet and free storage, then try again."
-            }
-            if (archive.exists()) check(archive.delete()) { "Could not replace previous model download" }
+        // Keep the archive in filesDir, not cacheDir: Android may clear cache while a
+        // large model is downloading. The .part file is kept between attempts so the download can resume.
+        if (!isValidZip(archive)) {
+            archive.delete()
+            downloadWithResume(partial)
             check(partial.renameTo(archive)) { "Could not save model archive in app storage" }
+        }
 
-            updateNotification("Installing Arabic voice model…")
+        updateNotification("Installing Arabic voice model…")
+        setModelStatus("Installing model…")
+        try {
             val temp = File(filesDir, "model-extract").apply { deleteRecursively(); check(mkdirs()) }
             ZipInputStream(BufferedInputStream(archive.inputStream())).use { zip ->
                 var entry = zip.nextEntry
@@ -116,8 +142,94 @@ class VoiceCommandService : Service() {
             check(temp.renameTo(modelDir)) { "Could not install model; check free storage" }
             archive.delete()
         } catch (e: Exception) {
-            partial.delete()
+            archive.delete()
             throw e
+        }
+    }
+
+    /** Downloads into [partial], retrying and resuming from where it stopped. Returns only when it holds a complete, valid ZIP. */
+    private fun downloadWithResume(partial: File) {
+        val maxAttempts = 5
+        var lastError: Exception? = null
+        for (attempt in 1..maxAttempts) {
+            if (destroyed) throw DownloadCancelled()
+            try {
+                fetchRange(partial)
+                if (!isValidZip(partial)) {
+                    partial.delete()
+                    throw IOException("Downloaded file is incomplete or corrupt")
+                }
+                return
+            } catch (e: DownloadCancelled) {
+                throw e
+            } catch (e: Exception) {
+                lastError = e
+                val message = "Download interrupted (attempt $attempt/$maxAttempts): ${e.message ?: e.javaClass.simpleName}"
+                event(message)
+                if (attempt < maxAttempts) {
+                    setModelStatus("$message. Retrying…")
+                    waitOrCancel(3_000L * attempt)
+                }
+            }
+        }
+        val reason = lastError?.message?.let { " ($it)" }.orEmpty()
+        throw IOException("Model download failed after $maxAttempts attempts. Check internet and free storage, then press Start voice control to resume.$reason")
+    }
+
+    /** One download attempt: continues [partial] with an HTTP Range request when possible, otherwise restarts from zero. */
+    private fun fetchRange(partial: File) {
+        var existing = if (partial.isFile) partial.length() else 0L
+        val connection = (URL(modelUrl).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 20_000
+            readTimeout = 30_000
+            instanceFollowRedirects = true
+            setRequestProperty("User-Agent", "TV-Voice-Remote/1.0 Android")
+            setRequestProperty("Accept-Encoding", "identity")
+            if (existing > 0) setRequestProperty("Range", "bytes=$existing-")
+        }
+        try {
+            connection.connect()
+            val code = connection.responseCode
+            var total = -1L
+            when (code) {
+                206 -> {
+                    val range = connection.getHeaderField("Content-Range").orEmpty()
+                    total = range.substringAfter('/', "").toLongOrNull() ?: -1L
+                    event("Resuming download from ${mb(existing)} MB")
+                }
+                200 -> {
+                    // The server ignored the Range request: start again from the beginning.
+                    existing = 0L
+                    total = connection.contentLengthLong
+                }
+                416 -> {
+                    val range = connection.getHeaderField("Content-Range").orEmpty()
+                    val size = range.substringAfter('/', "").toLongOrNull()
+                    if (size != null && size == existing) return // already complete
+                    partial.delete()
+                    throw IOException("Saved partial download did not match the server; restarting")
+                }
+                else -> throw IOException("Model download failed (HTTP $code)")
+            }
+            val append = code == 206
+            var done = if (append) existing else 0L
+            var lastReport = 0L
+            connection.inputStream.use { input ->
+                FileOutputStream(partial, append).use { output ->
+                    val buffer = ByteArray(64 * 1024)
+                    while (true) {
+                        if (destroyed) throw DownloadCancelled()
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        output.write(buffer, 0, count)
+                        done += count
+                        val now = SystemClock.elapsedRealtime()
+                        if (now - lastReport >= 1000) { lastReport = now; reportProgress(done, total) }
+                    }
+                }
+            }
+            reportProgress(done, total)
+            if (total > 0 && done != total) throw IOException("Connection closed early at ${mb(done)} of ${mb(total)} MB")
         } finally {
             connection.disconnect()
         }
@@ -131,6 +243,7 @@ class VoiceCommandService : Service() {
         recorder = audio
         check(audio.state == AudioRecord.STATE_INITIALIZED) { "Could not initialize microphone" }
         running = true
+        setModelStatus(null)
         updateNotification("Listening offline for Arabic commands")
         audio.startRecording()
         val buffer = ShortArray(bufferSize / 2)

@@ -67,6 +67,7 @@ class MainActivity : Activity() {
             stopService(Intent(this, VoiceCommandService::class.java))
             chooseModelFolder(requestRestoreFolder)
         })
+        root.addView(action("Import model from ADB folder") { importFromAppFolder() })
         val commands = TextView(this).apply {
             text = "Commands: تشغيل • إيقاف • التالي • السابق\nتقديم دقيقة • إرجاع دقيقة • ارفع الصوت • اخفض الصوت • كتم\nOptional wake phrase: تي في، التالي"
             textSize = 17f; setTextColor(0xFFE0E8F3.toInt()); gravity = Gravity.CENTER; setPadding(0, 14, 0, 14)
@@ -86,6 +87,7 @@ class MainActivity : Activity() {
     }
 
     private fun startVoice() {
+        operationStatus = null
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), requestMic); return
         }
@@ -101,7 +103,23 @@ class MainActivity : Activity() {
         val picker = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).addFlags(
             Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
         )
-        startActivityForResult(picker, code)
+        try {
+            startActivityForResult(picker, code)
+        } catch (_: android.content.ActivityNotFoundException) {
+            operationStatus = "No folder picker on this TV. Use \"Import model from ADB folder\" instead."
+            refresh()
+        }
+    }
+
+    private fun importFromAppFolder() {
+        stopService(Intent(this, VoiceCommandService::class.java))
+        operationStatus = "Importing model from app folder…"
+        refresh()
+        Thread {
+            val result = try { ModelStore.importFromAppFolder(applicationContext) }
+            catch (e: Exception) { "Model import failed: ${e.message ?: e.javaClass.simpleName}" }
+            runOnUiThread { operationStatus = result; refresh() }
+        }.start()
     }
 
     @Deprecated("TV compatibility")
@@ -132,7 +150,8 @@ class MainActivity : Activity() {
         if (!::status.isInitialized) return
         val active = getSharedPreferences("remote", MODE_PRIVATE).getBoolean("listening", false)
         val sessionReady = MediaAccessService.instance != null
-        status.text = operationStatus ?: "Microphone: ${if (active) "ON" else "OFF"}     Media access: ${if (sessionReady) "READY" else "enable in Settings"}\nArabic model downloads on first start (about 158 MB)."
+        val modelStatus = if (active) getSharedPreferences("remote", MODE_PRIVATE).getString("model_status", null) else null
+        status.text = operationStatus ?: "Microphone: ${if (active) "ON" else "OFF"}     Media access: ${if (sessionReady) "READY" else "enable in Settings"}\n${modelStatus ?: "Arabic model downloads on first start (about 158 MB)."}"
         log.text = getSharedPreferences("remote", MODE_PRIVATE).getString("events", "No events yet")
             ?.lines()?.takeLast(8)?.reversed()?.joinToString("\n") ?: "No events yet"
     }

@@ -38,8 +38,19 @@ Do not commit or lose the keystore. Every APK update must use this same key. Eac
 1. Install and open **TV Voice Remote**.
 2. Select **Enable media access** and enable its Notification access in Android settings.
 3. Select **Start voice control** and grant microphone access. The persistent notification shows when the microphone is active.
-4. The app downloads the Arabic Vosk model on first start (about 158 MB). Recognition is then local and audio is not uploaded.
+4. The app downloads the Arabic Vosk model on first start (about 158 MB). The screen and the notification show the progress (percent and MB). If the connection drops, it retries up to 5 times and resumes from where it stopped; pressing **Start voice control** again also resumes. Recognition is then local and audio is not uploaded.
 5. To keep the model when uninstalling, choose **Back up model to shared storage / USB** and select a shared folder (a USB drive is recommended). After reinstalling, choose **Restore model from shared storage / USB** and select that same folder. Android removes the saved folder permission on uninstall, so the folder must be selected again; the model files themselves remain outside the app and are not downloaded again.
+
+### Import the model with ADB (TVs without a file picker)
+
+If **Restore** says no app supports it, put the model in the app's own folder and use **Import model from ADB folder**:
+
+```bash
+adb shell mkdir -p /sdcard/Android/data/com.codex.tvremote/files
+adb push vosk-model /sdcard/Android/data/com.codex.tvremote/files/
+```
+
+`vosk-model` is the unzipped model folder (it must contain `am/final.mdl`); the original name `vosk-model-small-ar-tn-0.1-linto` also works. After the import, delete the pushed copy to free space.
 
 ## Supported phrases
 

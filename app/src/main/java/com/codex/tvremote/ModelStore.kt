@@ -10,8 +10,27 @@ import java.io.FileOutputStream
 /** Copies the Vosk model to/from a user-selected shared folder so it survives app uninstall. */
 object ModelStore {
     private const val MODEL_FOLDER = "vosk-model"
+    private const val ALT_MODEL_FOLDER = "vosk-model-small-ar-tn-0.1-linto"
 
     fun localModelDir(context: Context) = File(context.filesDir, MODEL_FOLDER)
+
+    /**
+     * Imports the model from the app's own external folder (Android/data/<package>/files/),
+     * which can be filled with `adb push`, so no file picker is needed on TVs without DocumentsUI.
+     * Accepts a folder named "vosk-model" or the original unzipped name; it must contain am/final.mdl.
+     */
+    fun importFromAppFolder(context: Context): String {
+        val base = context.getExternalFilesDir(null) ?: error("External app storage is not available")
+        val source = listOf(MODEL_FOLDER, ALT_MODEL_FOLDER).map { File(base, it) }.firstOrNull { it.resolve("am/final.mdl").isFile }
+            ?: error("No model found. Push the model folder to ${base.absolutePath}/$MODEL_FOLDER (it must contain am/final.mdl)")
+        val temp = File(context.filesDir, "model-import").apply { deleteRecursively(); check(mkdirs()) { "Could not prepare import folder" } }
+        source.copyRecursively(temp, overwrite = true)
+        check(temp.resolve("am/final.mdl").isFile) { "Copy failed: am/final.mdl is missing" }
+        val target = localModelDir(context)
+        target.deleteRecursively()
+        check(temp.renameTo(target)) { "Could not install model; check free storage" }
+        return "Model imported. You can delete the pushed copy and start voice control now."
+    }
 
     fun backup(context: Context, tree: Uri): String {
         val source = localModelDir(context)
