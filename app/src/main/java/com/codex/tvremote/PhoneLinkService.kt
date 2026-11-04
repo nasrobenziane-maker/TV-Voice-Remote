@@ -117,7 +117,7 @@ class PhoneLinkService : Service() {
         }
         failures.remove(ip)
         val command = parts[2].trim()
-        if (command !in CommandExecutor.COMMANDS) return "ERR unknown_command"
+        if (!CommandExecutor.isValidCommand(command)) return "ERR unknown_command"
         val result = try { CommandExecutor.run(applicationContext, command) } catch (e: Exception) { "Failed: ${e.message ?: e.javaClass.simpleName}" }
         if (command != "ping") TvEvents.add(this, "Phone: $command -> $result")
         return "OK " + result.replace('\n', ' ')

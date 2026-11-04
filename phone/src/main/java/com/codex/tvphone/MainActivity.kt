@@ -5,11 +5,14 @@ import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.graphics.Color
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
+import android.provider.Settings
 import android.text.InputType
 import android.view.Gravity
 import android.view.MotionEvent
@@ -21,6 +24,7 @@ import android.widget.LinearLayout
 import android.widget.RadioButton
 import android.widget.RadioGroup
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 
 class MainActivity : Activity() {
@@ -29,6 +33,8 @@ class MainActivity : Activity() {
     private lateinit var ipField: EditText
     private lateinit var pinField: EditText
     private lateinit var wakeField: EditText
+    private lateinit var commandsField: EditText
+    private lateinit var seekLabel: TextView
     private lateinit var talkButton: Button
     private lateinit var alwaysButton: Button
 
@@ -129,8 +135,36 @@ class MainActivity : Activity() {
         root.addView(pinField)
         root.addView(wakeField)
         root.addView(button("ابحث عن التلفاز تلقائيًا", 16f) { findTv() })
-        root.addView(button("حفظ", 16f) { saveFields(); EventLog.add("تم الحفظ") })
+        root.addView(button("حفظ", 16f) { if (saveFields()) EventLog.add("تم حفظ الإعدادات والعبارات") })
         root.addView(button("اختبار الاتصال", 16f) { testConnection() })
+
+        root.addView(heading("مقدار التقديم والإرجاع"))
+        seekLabel = label("القفزة الصوتية: ${Prefs.seekSeconds(this)} ثوانٍ", 15f, Color.WHITE)
+        root.addView(seekLabel)
+        root.addView(SeekBar(this).apply {
+            max = 11
+            progress = Prefs.seekSeconds(this@MainActivity) / 5 - 1
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(bar: SeekBar?, progress: Int, fromUser: Boolean) {
+                    val seconds = (progress + 1) * 5
+                    seekLabel.text = "القفزة الصوتية: $seconds ثوانٍ"
+                    if (fromUser) Prefs.setSeekSeconds(this@MainActivity, seconds)
+                }
+                override fun onStartTrackingTouch(bar: SeekBar?) { }
+                override fun onStopTrackingTouch(bar: SeekBar?) { }
+            })
+        })
+        root.addView(label("يُطبّق هذا المقدار على أوامر التقديم والإرجاع التي يرسلها الهاتف.", 14f, 0xFFD1D8E2.toInt()))
+
+        root.addView(heading("عبارات الأوامر القابلة للتعديل"))
+        root.addView(label("سطر لكل أمر: command=عبارة | عبارة بديلة. اترك أسماء الأوامر كما هي، وعدّل العبارات فقط.", 14f, 0xFFD1D8E2.toInt()))
+        root.addView(label("مثال: «الصوت 10» يضبطه إلى 10٪، و«زيد الصوت 10» أو «نقص الصوت 10» يغيّره 10 نقاط مئوية.", 14f, 0xFFD1D8E2.toInt()))
+        commandsField = field("play=شغل | كمل", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE).apply {
+            setText(CommandParser.readText(this@MainActivity)); minLines = 10; gravity = Gravity.TOP or Gravity.START; setSingleLine(false)
+        }
+        root.addView(commandsField, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(230)))
+        root.addView(button("فتح إعداد استثناء البطارية", 16f) { openBatterySettings() })
+        root.addView(label("قد تحتاج إلى السماح بالتشغيل في الخلفية كي لا يوقف الهاتف الاستماع الدائم.", 14f, 0xFFD1D8E2.toInt()))
 
         // Model
         root.addView(heading("نموذج التعرف على الصوت (مرة واحدة)"))
@@ -173,7 +207,7 @@ class MainActivity : Activity() {
             ModelManager.isInstalled(this) -> "جاهز ✓"
             else -> "غير مثبت"
         }
-        status.text = "النموذج: $model\nالاستماع الدائم: ${if (ListeningService.active) "يعمل" else "متوقف"}\nكلمة التنبيه: ${Prefs.wake(this)}"
+        status.text = "النموذج: $model\nالاستماع الدائم: ${if (ListeningService.active) "يعمل" else "متوقف"}\nكلمة التنبيه: ${Prefs.wake(this)}\nاستثناء البطارية: ${if (batteryExempt()) "مفعّل" else "غير مفعّل"}"
         alwaysButton.text = if (ListeningService.active) "أوقف الاستماع الدائم" else "ابدأ الاستماع الدائم"
         log.text = EventLog.text()
     }
@@ -191,16 +225,19 @@ class MainActivity : Activity() {
         updateModeViews(always)
     }
 
-    private fun saveFields() {
+    private fun saveFields(): Boolean {
+        try { CommandParser.saveText(this, commandsField.text.toString()) }
+        catch (e: Exception) { EventLog.add("تعذر حفظ العبارات: ${e.message ?: "تحقق من الصيغة"}"); return false }
         Prefs.save(this, ipField.text.toString().trim(), pinField.text.toString().trim(), wakeField.text.toString().trim())
         // A new wake word needs a fresh recognizer.
         if (ListeningService.active) startService(Intent(this, ListeningService::class.java))
+        return true
     }
 
     private fun startAlways() {
         if (!ensurePermissions(true)) { EventLog.add("امنح إذن الميكروفون ثم اضغط مرة أخرى"); return }
         if (!ModelManager.isInstalled(this)) { EventLog.add("ثبّت النموذج أولًا"); return }
-        saveFields()
+        if (!saveFields()) return
         try { startForegroundService(Intent(this, ListeningService::class.java)) }
         catch (e: Exception) { EventLog.add("تعذر بدء الاستماع: ${e.message ?: e.javaClass.simpleName}") }
     }
@@ -209,8 +246,22 @@ class MainActivity : Activity() {
         stopService(Intent(this, ListeningService::class.java))
     }
 
+    private fun batteryExempt(): Boolean = Build.VERSION.SDK_INT < 23 ||
+        (getSystemService(POWER_SERVICE) as PowerManager).isIgnoringBatteryOptimizations(packageName)
+
+    private fun openBatterySettings() {
+        val intent = if (Build.VERSION.SDK_INT >= 23) Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+            data = Uri.parse("package:$packageName")
+        } else Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+        try { startActivity(intent) }
+        catch (_: ActivityNotFoundException) {
+            try { startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
+            catch (_: Exception) { EventLog.add("افتح إعدادات البطارية يدويًا واستثنِ التطبيق من التحسين") }
+        }
+    }
+
     private fun testConnection() {
-        saveFields()
+        if (!saveFields()) return
         EventLog.add("جارٍ اختبار الاتصال…")
         CommandSender.send(this, "ping") { r -> EventLog.add(if (r.ok) "الاتصال بالتلفاز ناجح ✓" else r.message) }
     }

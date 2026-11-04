@@ -105,7 +105,7 @@ object VoiceEngine {
                 return
             }
             if (generation != gen) return
-            val recognizer = Recognizer(m, 16000.0f, CommandParser.grammar(Prefs.wake(ctx)))
+            val recognizer = Recognizer(m, 16000.0f, CommandParser.grammar(ctx, Prefs.wake(ctx)))
             rec = recognizer
             val min = AudioRecord.getMinBufferSize(16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
             check(min > 0) { "الميكروفون غير متاح" }
@@ -157,7 +157,7 @@ object VoiceEngine {
             EventLog.add("سمعت كلمة التنبيه — قل الأمر الآن")
             return
         }
-        val command = CommandParser.parse(rest)
+        val command = CommandParser.parse(ctx, rest)
         val allowed = mode == Mode.PUSH || hasWake || now < armedUntil
         if (command == null) {
             if (allowed) EventLog.add("سمعت: $raw (ليس أمرًا)")
@@ -169,7 +169,11 @@ object VoiceEngine {
         }
         armedUntil = 0L
         EventLog.add("سمعت: $raw ← $command")
-        CommandSender.send(ctx, command) { result ->
+        val outgoingCommand = when (command) {
+            "forward", "back" -> "${command}_${Prefs.seekSeconds(ctx)}"
+            else -> command
+        }
+        CommandSender.send(ctx, outgoingCommand) { result ->
             EventLog.add(result.message)
             if (result.ok) vibrate(ctx)
         }

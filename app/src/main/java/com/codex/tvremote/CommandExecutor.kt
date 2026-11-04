@@ -11,6 +11,16 @@ object CommandExecutor {
         "volume_up", "volume_down", "mute", "unmute", "open_youtube"
     )
 
+    fun isValidCommand(command: String): Boolean {
+        if (command in COMMANDS) return true
+        val volume = Regex("^(volume_set|volume_up|volume_down)_([0-9]{1,3})$").matchEntire(command)
+            ?.groupValues?.get(2)?.toIntOrNull()
+        if (volume != null && volume in 0..100) return true
+        val seek = Regex("^(forward|back)_([0-9]{1,2})$").matchEntire(command)
+            ?.groupValues?.get(2)?.toIntOrNull()
+        return seek != null && seek in 1..60
+    }
+
     private val youtubePackages = listOf("com.google.android.youtube.tv", "com.google.android.youtube")
 
     fun run(context: Context, command: String): String = when (command) {

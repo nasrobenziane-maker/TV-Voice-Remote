@@ -6,6 +6,8 @@ import android.media.session.MediaController
 import android.media.session.PlaybackState
 import android.service.notification.NotificationListenerService
 import android.content.ComponentName
+import android.os.SystemClock
+import kotlin.math.roundToInt
 
 class MediaAccessService : NotificationListenerService() {
     companion object {
@@ -24,6 +26,11 @@ class MediaAccessService : NotificationListenerService() {
                 .firstOrNull()
         } catch (_: SecurityException) { null }
 
+        Regex("^volume_set_([0-9]{1,3})$").matchEntire(command)?.let { return setVolumePercent(it.groupValues[1].toInt()) }
+        Regex("^volume_up_([0-9]{1,3})$").matchEntire(command)?.let { return changeVolumePercent(it.groupValues[1].toInt()) }
+        Regex("^volume_down_([0-9]{1,3})$").matchEntire(command)?.let { return changeVolumePercent(-it.groupValues[1].toInt()) }
+        Regex("^forward_([0-9]{1,2})$").matchEntire(command)?.let { return seek(session, it.groupValues[1].toLong() * 1000) }
+        Regex("^back_([0-9]{1,2})$").matchEntire(command)?.let { return seek(session, -it.groupValues[1].toLong() * 1000) }
         return when (command) {
             "play" -> session?.let { it.transportControls.play(); "Play sent to ${appName(it)}" } ?: "No active media session"
             "pause" -> session?.let { it.transportControls.pause(); "Pause sent to ${appName(it)}" } ?: "No active media session"
@@ -44,9 +51,33 @@ class MediaAccessService : NotificationListenerService() {
         if ((state.actions and PlaybackState.ACTION_SEEK_TO) == 0L) return "This app does not allow seeking"
         val durationValue = controller.metadata?.getLong(android.media.MediaMetadata.METADATA_KEY_DURATION) ?: Long.MAX_VALUE
         val duration = if (durationValue > 0L) durationValue else Long.MAX_VALUE
-        val position = (state.position + delta).coerceAtLeast(0).coerceAtMost(duration)
+        val elapsed = (SystemClock.elapsedRealtime() - state.lastPositionUpdateTime).coerceAtLeast(0L)
+        val current = if (state.state == PlaybackState.STATE_PLAYING && state.lastPositionUpdateTime > 0L)
+            state.position + (elapsed * state.playbackSpeed).toLong()
+        else state.position
+        val position = (current + delta).coerceAtLeast(0L).coerceAtMost(duration)
         controller.transportControls.seekTo(position)
-        return if (delta > 0) "Forward one minute" else "Back one minute"
+        return if (delta > 0) "Forward ${delta / 1000} seconds" else "Back ${-delta / 1000} seconds"
+    }
+
+    private fun setVolumePercent(percent: Int): String {
+        if (percent !in 0..100) return "Volume percentage must be 0–100"
+        val a = audio()
+        val max = a.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        val target = (max * percent / 100f).roundToInt().coerceIn(0, max)
+        a.setStreamVolume(AudioManager.STREAM_MUSIC, target, AudioManager.FLAG_SHOW_UI)
+        return "Volume set to $percent%"
+    }
+
+    private fun changeVolumePercent(delta: Int): String {
+        if (delta !in -100..100) return "Volume change must be between 0 and 100%"
+        val a = audio()
+        val max = a.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        val current = a.getStreamVolume(AudioManager.STREAM_MUSIC)
+        val step = (max * kotlin.math.abs(delta) / 100f).roundToInt().coerceAtLeast(if (delta == 0) 0 else 1)
+        val target = (current + (if (delta >= 0) step else -step)).coerceIn(0, max)
+        a.setStreamVolume(AudioManager.STREAM_MUSIC, target, AudioManager.FLAG_SHOW_UI)
+        return "Volume changed by ${kotlin.math.abs(delta)}%"
     }
 
     private fun audio() = getSystemService(AUDIO_SERVICE) as AudioManager
